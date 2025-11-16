@@ -330,11 +330,13 @@ if auth_mode != "none":
 
         # Footer
         st.sidebar.markdown("---")
-        st.sidebar.markdown("**Created by:** Hridhi Nandu P P")
+        st.sidebar.markdown("**Created by:**")
         st.sidebar.markdown("---")
+        st.sidebar.markdown("- Hridhi Nandu P P")
         st.sidebar.markdown("- Vikash R")
         st.sidebar.markdown("- Rakesh M")
-        st.sidebar.caption("Bulk outreach with SMTP + Gmail API dual delivery.")
+        st.sidebar.markdown("---")
+        st.sidebar.caption("App Version : HR14.0")
         st.sidebar.markdown("[Documentation](<https://www.notion.so/Bulk-Outreach-Email-Application-2ad81f2b2f7c80ab8194d91ff140eaa3?source=copy_link>)")
 
         st.stop()
@@ -387,6 +389,45 @@ cooldown_s = st.sidebar.number_input(
     value=30,
     step=1,
 )
+
+# Advanced: randomised per-email delay
+use_random_delay = st.sidebar.checkbox(
+    "Advanced: randomize delay between sends",
+    value=False,
+    help=(
+        "When enabled, each email waits a random delay between the min/max you choose "
+        "instead of a fixed cooldown. The existing cooldown above acts as the baseline."
+    ),
+)
+
+if use_random_delay:
+    default_min = max(0, int(cooldown_s * 0.7))
+    # avoid zero-width range; fall back to cooldown_s+5 if needed
+    default_max = int(cooldown_s * 1.3) if cooldown_s > 0 else 5
+    default_max = min(600, max(default_min, default_max))
+
+    cooldown_min_s = st.sidebar.number_input(
+        "Min delay between sends (s)",
+        min_value=0,
+        max_value=600,
+        value=default_min,
+        step=1,
+    )
+    cooldown_max_s = st.sidebar.number_input(
+        "Max delay between sends (s)",
+        min_value=0,
+        max_value=600,
+        value=default_max,
+        step=1,
+    )
+
+    # Safety: ensure max >= min for what we send to the backend
+    if cooldown_max_s < cooldown_min_s:
+        st.sidebar.warning("Max delay is less than min delay; adjusting to match min.")
+        cooldown_max_s = cooldown_min_s
+else:
+    cooldown_min_s = cooldown_s
+    cooldown_max_s = cooldown_s
 
 font_key = st.sidebar.selectbox(
     "Email font family",
@@ -662,6 +703,9 @@ with tab1:
                     "force_send_duplicates": force_send_duplicates,
                     "selected_indices": selected_indices,
                     "cooldown_s": cooldown_s,
+                    "cooldown_random_enabled": use_random_delay,
+                    "cooldown_min_s": cooldown_min_s,
+                    "cooldown_max_s": cooldown_max_s,
                     "schedule": schedule_info,
                 },
                 csv_file,
@@ -867,6 +911,9 @@ with tab2:
                     "font_size_px": font_px,
                     "para_gap_px": para_gap_px,
                     "cooldown_s": cooldown_s,
+                    "cooldown_random_enabled": use_random_delay,
+                    "cooldown_min_s": cooldown_min_s,
+                    "cooldown_max_s": cooldown_max_s,
                     "force_reply": force_reply,
                     "schedule": schedule_info,
                 },

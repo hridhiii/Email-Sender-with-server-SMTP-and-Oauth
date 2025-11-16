@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import random
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -607,7 +608,19 @@ def module1_send_task(self, job_id: str, payload_path: str):
         label_name = P.get("label_name") or ""
         cooldown = int(P.get("cooldown_s", 30))
         overhead = int(P.get("overhead_s", 3))
+        cooldown_random_enabled = bool(P.get("cooldown_random_enabled", False))
+        cooldown_min_s = int(P.get("cooldown_min_s", cooldown))
+        cooldown_max_s = int(P.get("cooldown_max_s", cooldown))
         force_send_duplicates = bool(P.get("force_send_duplicates", False))
+
+        def _compute_cooldown_for_row() -> float:
+            """Return cooldown (seconds) for this row, applying randomness if enabled."""
+            if cooldown_random_enabled:
+                lo = max(0.0, float(cooldown_min_s))
+                hi = max(lo, float(cooldown_max_s))
+                if hi > 0:
+                    return random.uniform(lo, hi)
+            return float(max(0, cooldown))
 
         subject_template = P.get("subject_template") or ""
         body_html_template = P.get("body_html_template") or ""
@@ -895,23 +908,26 @@ def module1_send_task(self, job_id: str, payload_path: str):
                 pd.DataFrame(rows).to_csv(os.path.join(job_dir, "result.csv"), index=False)
                 _update_state(self, job_id, "m1", rows, total)
 
-                if i < total - 1 and act == "send" and cooldown > 0:
-                    sleep_total = cooldown + overhead
-                    slept = 0
-                    while slept < sleep_total:
-                        flag2 = _maybe_pause_or_stop(job_dir)
+                if i < total - 1 and act == "send":
+                    # Compute per-email cooldown (fixed or random) and add overhead.
+                    base_delay = _compute_cooldown_for_row()
+                    sleep_total = max(0.0, base_delay + float(overhead))
+                    if sleep_total > 0:
+                        slept = 0.0
+                        while slept < sleep_total:
+                            flag2 = _maybe_pause_or_stop(job_dir)
+                            if flag2 == "stop":
+                                _write_log(job_dir, "STOP flag detected during cooldown. Ending job.")
+                                break
+                            if flag2 == "pause":
+                                time.sleep(1.0)
+                                slept += 1.0
+                                continue
+                            step = min(1.0, sleep_total - slept)
+                            time.sleep(step)
+                            slept += step
                         if flag2 == "stop":
-                            _write_log(job_dir, "STOP flag detected during cooldown. Ending job.")
                             break
-                        if flag2 == "pause":
-                            time.sleep(1.0)
-                            slept += 1.0
-                            continue
-                        step = min(1.0, sleep_total - slept)
-                        time.sleep(step)
-                        slept += step
-                    if flag2 == "stop":
-                        break
 
             _write_log(job_dir, f"Job finished. Sent={sent_count} of {total}.")
             try:
@@ -965,6 +981,18 @@ def module2_followup_task(self, job_id: str, payload_path: str):
         app_password = decrypt_secret(P.get("app_password_enc") or P.get("app_password", ""))
         from_name = P.get("from_name") or ""
         cooldown = int(P.get("cooldown_s", 30))
+        cooldown_random_enabled = bool(P.get("cooldown_random_enabled", False))
+        cooldown_min_s = int(P.get("cooldown_min_s", cooldown))
+        cooldown_max_s = int(P.get("cooldown_max_s", cooldown))
+
+        def _compute_cooldown_for_row() -> float:
+            """Return cooldown (seconds) for this follow-up row, applying randomness if enabled."""
+            if cooldown_random_enabled:
+                lo = max(0.0, float(cooldown_min_s))
+                hi = max(lo, float(cooldown_max_s))
+                if hi > 0:
+                    return random.uniform(lo, hi)
+            return float(max(0, cooldown))
 
         body_html_template = P.get("body_html_template") or ""
 
@@ -1333,23 +1361,24 @@ def module2_followup_task(self, job_id: str, payload_path: str):
             pd.DataFrame(rows).to_csv(os.path.join(job_dir, "result.csv"), index=False)
             _update_state(self, job_id, "m2", rows, total)
 
-            if i < total - 1 and cooldown > 0:
-                sleep_total = cooldown
-                slept = 0
-                while slept < sleep_total:
-                    flag2 = _maybe_pause_or_stop(job_dir)
+            if i < total - 1:
+                sleep_total = _compute_cooldown_for_row()
+                if sleep_total > 0:
+                    slept = 0.0
+                    while slept < sleep_total:
+                        flag2 = _maybe_pause_or_stop(job_dir)
+                        if flag2 == "stop":
+                            _write_log(job_dir, "STOP flag detected during cooldown. Ending job.")
+                            break
+                        if flag2 == "pause":
+                            time.sleep(1.0)
+                            slept += 1.0
+                            continue
+                        step = min(1.0, sleep_total - slept)
+                        time.sleep(step)
+                        slept += step
                     if flag2 == "stop":
-                        _write_log(job_dir, "STOP flag detected during cooldown. Ending job.")
                         break
-                    if flag2 == "pause":
-                        time.sleep(1.0)
-                        slept += 1.0
-                        continue
-                    step = min(1.0, sleep_total - slept)
-                    time.sleep(step)
-                    slept += step
-                if flag2 == "stop":
-                    break
 
         _write_log(
             job_dir,
