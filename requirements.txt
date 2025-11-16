@@ -1,0 +1,10 @@
+streamlit==1.39.0
+streamlit-quill==0.0.3
+streamlit-autorefresh==1.0.1
+pandas==2.2.2
+celery==5.3.6
+redis==5.0.4
+python-dotenv==1.0.1
+email-validator==2.2.0
+cryptography==43.0.0
+pytest==8.3.3
