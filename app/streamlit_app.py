@@ -331,8 +331,11 @@ if auth_mode != "none":
         # Footer
         st.sidebar.markdown("---")
         st.sidebar.markdown("**Created by:** Hridhi Nandu P P")
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("- Vikash R")
+        st.sidebar.markdown("- Rakesh M")
         st.sidebar.caption("Bulk outreach with SMTP + Gmail API dual delivery.")
-        st.sidebar.markdown("[📘 Documentation](<https://www.notion.so/Bulk-Outreach-Email-Application-2ad81f2b2f7c80ab8194d91ff140eaa3?source=copy_link>)")
+        st.sidebar.markdown("[Documentation](<https://www.notion.so/Bulk-Outreach-Email-Application-2ad81f2b2f7c80ab8194d91ff140eaa3?source=copy_link>)")
 
         st.stop()
     else:
