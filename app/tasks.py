@@ -1172,7 +1172,7 @@ def module2_followup_task(self, job_id: str, payload_path: str):
                     if not mid:
                         continue
                     try:
-                        if check_reply_exists(M, mid, from_email, to_addr):
+                        if check_reply_exists(M, mid, from_email, to_addr, orig_subj):
                             reply_detected = True
                             break
                     except Exception as e:
@@ -1207,7 +1207,7 @@ def module2_followup_task(self, job_id: str, payload_path: str):
                     pass
 
                     try:
-                        if check_reply_exists(M, mid, from_email, to_addr):
+                        if check_reply_exists(M, mid, from_email, to_addr, orig_subj):
                             reply_detected = True
                             break
                     except Exception as e:
