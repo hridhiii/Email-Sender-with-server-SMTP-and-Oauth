@@ -10,7 +10,7 @@ import time
 import email
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from email.utils import formataddr
+from email.utils import formataddr, make_msgid
 from email.mime.application import MIMEApplication
 
 SMTP_HOST = "smtp.gmail.com"
@@ -22,16 +22,30 @@ MAILER_DAEMON = ("mailer-daemon@googlemail.com", "Mail Delivery Subsystem")
 
 
 def smtp_send_html(from_email: str, app_password: str, from_name: str,
-                   to_email: str, subject: str, html_body: str) -> None:
+                   to_email: str, subject: str, html_body: str) -> str:
+    """
+    Send an HTML email via Gmail SMTP and return the RFC 2822 Message-ID we used.
+
+    We explicitly generate a stable Message-ID header before sending so that:
+      - Module 1 can always record a non-empty orig_message_id in the CSV,
+      - Module 2 (SMTP mode) can reliably use that ID for reply detection,
+      - IMAP-based labeling can search by Message-ID instead of only by TO.
+    """
     msg = MIMEMultipart()
     msg["From"] = formataddr((from_name, from_email)) if from_name else from_email
     msg["To"] = to_email
     msg["Subject"] = subject
+    # Ensure we always have a Message-ID for downstream threading logic.
+    if not msg.get("Message-ID"):
+        msg["Message-ID"] = make_msgid()
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT_SSL) as server:
         server.login(from_email, app_password)
         server.sendmail(from_email, [to_email], msg.as_string())
+
+    # Return the Message-ID so callers can persist it in the result CSV
+    return msg["Message-ID"]
 
 
 def smtp_build_mime(from_email: str, from_name: str,
@@ -68,6 +82,64 @@ def imap_search_last_sent_to_uid(M: imaplib.IMAP4_SSL, to_email: str):
     return (last_uid.decode() if isinstance(last_uid, bytes) else str(last_uid), msg)
 
 
+
+def imap_find_message_by_message_id(M: imaplib.IMAP4_SSL, message_id: str):
+    """
+    Locate the most recent message in Gmail Sent with the given Message-ID.
+
+    Returns (uid, email.message.Message | None). If the UID is found but the
+    RFC822 body cannot be fetched, returns (uid, None).
+    """
+    if not M:
+        return None, None
+    message_id = (message_id or "").strip()
+    if not message_id:
+        return None, None
+    try:
+        typ, _ = M.select(GMAIL_SENT)
+        if typ != "OK":
+            return None, None
+
+        core = message_id.strip().strip("<>")
+        if not core:
+            return None, None
+
+        variants = []
+        for v in (message_id, core, f"<{core}>"):
+            v = v.strip()
+            if v and v not in variants:
+                variants.append(v)
+
+        all_uids = []
+        for v in variants:
+            typ, data = M.uid("search", None, "HEADER", "Message-ID", f'"{v}"')
+            if typ == "OK" and data and data[0]:
+                all_uids.extend(data[0].split())
+
+        if not all_uids:
+            return None, None
+
+        # De-duplicate while preserving order, then take the last match.
+        seen = set()
+        unique_uids = []
+        for uid in all_uids:
+            key = uid.decode() if isinstance(uid, bytes) else str(uid)
+            if key not in seen:
+                seen.add(key)
+                unique_uids.append(uid)
+
+        last_uid = unique_uids[-1]
+        typ, msgdata = M.uid("fetch", last_uid, "(RFC822)")
+        if typ != "OK" or not msgdata or not msgdata[0]:
+            return (last_uid.decode() if isinstance(last_uid, bytes) else str(last_uid), None)
+
+        msg = email.message_from_bytes(msgdata[0][1])
+        return (last_uid.decode() if isinstance(last_uid, bytes) else str(last_uid), msg)
+    except Exception:
+        # Best-effort only – callers should treat failures as "not found".
+        return None, None
+
+
 def imap_add_label_to_uid(M: imaplib.IMAP4_SSL, uid_val: str, label: str) -> None:
     if not (M and uid_val and label):
         return
@@ -95,36 +167,56 @@ def check_reply_exists(
     orig_subject: str = "",
 ) -> bool:
     """Best-effort heuristic: detect whether the peer has replied in this conversation (SMTP/IMAP).
-
+    
     Strategy (SMTP mode is inherently more approximate than Gmail API threads):
-
+    
     1. **Primary check – Message-ID threading**
        - Build a few variants of the stored `orig_message_id` (with and without angle
          brackets) and search both "INBOX" and "[Gmail]/All Mail" for messages whose
          `References` or `In-Reply-To` headers contain any of those variants.
        - For any such message:
-           * Ignore messages clearly from `from_email` (the sending account).
-           * If the sender is `peer_email` or any other non-me address, treat this as
-             a reply and return True.
-
+         * Ignore messages clearly from `from_email` (the sending account).
+         * If the sender is `peer_email`, treat this as a reply and return True.
+    
     2. **Fallback – subject + FROM match**
        - If no Message-ID–based hits are found, search for messages:
-             FROM peer_email  AND  SUBJECT contains (a token from `orig_subject`)
+         FROM peer_email AND SUBJECT contains (a token from `orig_subject`)
          in "INBOX" and "[Gmail]/All Mail".
-       - If we find any such message not clearly from `from_email`, treat it as a
-         reply and return True.
-
-    3. If both checks find nothing, return False.
-
-    This is intentionally a bit conservative: for a given campaign row, *any* mail
-    from the prospect that matches the subject thread (or references the message-id)
-    counts as "prospect has replied", and Module 2 will skip further follow-ups.
+       - If we find any such message from the prospect, treat it as a reply.
+    
+    3. **Additional check – Direct FROM search**
+       - Search for ANY messages from peer_email that might be in the conversation
+       - This catches cases where threading headers aren't properly set
+    
+    4. If all checks find nothing, return False.
+    
+    This is intentionally conservative: for a given campaign row, we only count
+    emails specifically from the prospect as "replied", and Module 2 will skip
+    further follow-ups only when the prospect has actually responded.
     """
     orig_message_id = (orig_message_id or "").strip()
-    me_lc = (from_email or "").strip().lower()
-    peer_lc = (peer_email or "").strip().lower()
+    from_email_normalized = (from_email or "").strip().lower()
+    peer_email_normalized = (peer_email or "").strip().lower()
 
-    # Normalise Message-ID variants: bare core and <core>
+    # Helper function to check if email address is from the sender (me)
+    def is_from_me(from_header: str) -> bool:
+        """Check if From header is from the sending account, handling display names."""
+        from_lower = (from_header or "").strip().lower()
+        if not from_lower:
+            return False
+        # Check if our email appears anywhere in the From header
+        # This handles both "email@domain.com" and "Name <email@domain.com>" formats
+        return from_email_normalized in from_lower
+    
+    # Helper function to check if email address is from the prospect
+    def is_from_prospect(from_header: str) -> bool:
+        """Check if From header is from the prospect."""
+        from_lower = (from_header or "").strip().lower()
+        if not from_lower:
+            return False
+        return peer_email_normalized in from_lower
+
+    # Normalise Message-ID variants: bare core and angle-bracketed versions
     variants = set()
     if orig_message_id:
         variants.add(orig_message_id)
@@ -133,19 +225,7 @@ def check_reply_exists(
             variants.add(core)
             variants.add(f"<{core}>")
 
-    def _contains_any(hval: str) -> bool:
-        if not variants:
-            return False
-        s = (hval or "").lower()
-        if not s:
-            return False
-        for v in variants:
-            if v.lower() in s:
-                return True
-        return False
-
     # 1) Message-ID–based threading (preferred).
-    found_any_mid_hit = False
     for mbox in ('"INBOX"', '"[Gmail]/All Mail"'):
         try:
             typ, _ = M.select(mbox)
@@ -165,37 +245,36 @@ def check_reply_exists(
             msg_ids = [mid for mid in msg_ids if not (mid in seen or seen.add(mid))]
 
             for mid in msg_ids:
-                found_any_mid_hit = True
                 typ, msgdata = M.uid("fetch", mid, "(RFC822.HEADER)")
                 if typ != "OK" or not msgdata or not msgdata[0]:
                     continue
-                msg = email.message_from_bytes(msgdata[0][1])
-                frm = (msg.get("From") or "").lower()
 
-                # Ignore messages clearly from me (the sender)
-                if me_lc and me_lc in frm:
+                msg = email.message_from_bytes(msgdata[0][1])
+                frm = msg.get("From") or ""
+
+                # Skip messages from me (the sender)
+                if is_from_me(frm):
                     continue
 
-                # If the prospect themselves replied, that's definitely a reply.
-                if peer_lc and peer_lc in frm:
+                # ✅ ONLY return True if it's specifically from the prospect
+                if is_from_prospect(frm):
                     return True
-
-                # Otherwise, ANY non-me sender in this referenced chain counts as reply.
-                if frm.strip():
-                    return True
+                
+                # ✅ REMOVED: The buggy "any non-me sender" logic
 
         except Exception:
             # Best-effort: IMAP quirks shouldn't crash the job.
             continue
 
-    # 2) Fallback – FROM + SUBJECT match, only if Message-ID–based search found nothing.
-    if not found_any_mid_hit and peer_lc and orig_subject:
+    # 2) Fallback – FROM + SUBJECT match
+    if peer_email_normalized and orig_subject:
         # Use a short, stable token from the subject (strip "Re:" and whitespace).
         subj = orig_subject
         # Normalise "Re: " prefix away
         if subj.lower().startswith("re:"):
             subj = subj[3:]
         subj = subj.strip()
+
         # Take a reasonable-length prefix to search for
         token = subj[:40] if len(subj) > 40 else subj
 
@@ -213,19 +292,55 @@ def check_reply_exists(
                         typ, msgdata = M.uid("fetch", mid, "(RFC822.HEADER)")
                         if typ != "OK" or not msgdata or not msgdata[0]:
                             continue
-                        msg = email.message_from_bytes(msgdata[0][1])
-                        frm = (msg.get("From") or "").lower()
 
-                        # Ignore anything clearly from me.
-                        if me_lc and me_lc in frm:
+                        msg = email.message_from_bytes(msgdata[0][1])
+                        frm = msg.get("From") or ""
+
+                        # Skip messages from me
+                        if is_from_me(frm):
                             continue
 
-                        if frm.strip():
+                        # ✅ ONLY return True if from prospect
+                        if is_from_prospect(frm):
                             return True
 
                 except Exception:
                     # Ignore mailbox-specific errors, continue to next.
                     continue
+
+    # 3) Additional direct FROM search (catches cases where threading fails)
+    if peer_email_normalized:
+        for mbox in ('"INBOX"', '"[Gmail]/All Mail"'):
+            try:
+                typ, _ = M.select(mbox)
+                if typ != "OK":
+                    continue
+
+                # Search for ANY messages from the prospect
+                typ, data = M.uid("search", None, "FROM", f'"{peer_email}"')
+                msg_ids = data[0].split() if (typ == "OK" and data and data[0]) else []
+
+                # Check recent messages (last 10) to avoid scanning entire inbox
+                for mid in msg_ids[-10:]:
+                    typ, msgdata = M.uid("fetch", mid, "(RFC822.HEADER)")
+                    if typ != "OK" or not msgdata or not msgdata[0]:
+                        continue
+
+                    msg = email.message_from_bytes(msgdata[0][1])
+                    frm = msg.get("From") or ""
+                    
+                    # Verify it's actually from prospect
+                    if is_from_prospect(frm):
+                        # Check if subject is related to our conversation
+                        msg_subject = (msg.get("Subject") or "").lower()
+                        orig_subject_lower = (orig_subject or "").lower().replace("re:", "").strip()
+                        
+                        # If subject matches or references our message, count as reply
+                        if orig_subject_lower and orig_subject_lower[:30] in msg_subject:
+                            return True
+
+            except Exception:
+                continue
 
     return False
 

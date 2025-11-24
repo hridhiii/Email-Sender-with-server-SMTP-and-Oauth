@@ -16,6 +16,7 @@ from .imap_smtp_utils import (
     smtp_build_mime,
     imap_login,
     imap_search_last_sent_to_uid,
+    imap_find_message_by_message_id,
     imap_add_label_to_uid,
     imap_append_draft,
     check_reply_exists,
@@ -831,27 +832,58 @@ def module1_send_task(self, job_id: str, payload_path: str):
                                     f"[{i+1}/{total}] WARNING: could not enrich OAuth send metadata for {to_addr}: {e}",
                                 )
                         else:
-                            smtp_send_html(from_email, app_password, from_name, to_addr, subj_now, final_html)
+                            msg_id_local = smtp_send_html(from_email, app_password, from_name, to_addr, subj_now, final_html)
                             _write_log(job_dir, f"[{i+1}/{total}] SENT -> {to_addr}")
                             sent_count += 1
+
+                            # Persist the RFC 2822 Message-ID we used so that:
+                            #  - Module 2 (SMTP) can reliably detect replies, and
+                            #  - IMAP labeling can search by Message-ID instead of only TO.
+                            if msg_id_local:
+                                r["orig_message_id"] = msg_id_local
+                                r["rfc_message_id"] = msg_id_local
 
                         record_sent_hash(from_email, to_addr, "m1", job_id)
                         sent_hashes.add(hash_email(to_addr))
 
                         if M:
                             uid_val, msg_obj = None, None
-                            for _ in range(5):
-                                try:
-                                    uid_val, msg_obj = imap_search_last_sent_to_uid(M, to_addr)
-                                except Exception:
-                                    uid_val, msg_obj = (None, None)
-                                if msg_obj is not None:
-                                    break
-                                time.sleep(2)
+
+                            # Prefer an exact lookup by RFC 2822 Message-ID when we have it.
+                            msgid_for_lookup = str(r.get("orig_message_id") or r.get("rfc_message_id") or "").strip()
+                            if msgid_for_lookup:
+                                for _ in range(5):
+                                    try:
+                                        uid_val, msg_obj = imap_find_message_by_message_id(M, msgid_for_lookup)
+                                    except Exception:
+                                        uid_val, msg_obj = (None, None)
+                                    if msg_obj is not None:
+                                        break
+                                    time.sleep(2)
+
+                            # Fallback: if we still haven't found the message, fall back to the
+                            # older "search by TO" heuristic.
+                            if msg_obj is None:
+                                for _ in range(5):
+                                    try:
+                                        uid_val, msg_obj = imap_search_last_sent_to_uid(M, to_addr)
+                                    except Exception:
+                                        uid_val, msg_obj = (None, None)
+                                    if msg_obj is not None:
+                                        break
+                                    time.sleep(2)
+
                             if msg_obj:
-                                r["orig_message_id"] = msg_obj.get("Message-ID", "") or ""
-                                r["orig_references"] = msg_obj.get("References", "") or ""
-                                r["orig_date"] = msg_obj.get("Date", "") or ""
+                                msg_mid = msg_obj.get("Message-ID", "") or ""
+                                if msg_mid:
+                                    # If Gmail provided its own Message-ID, prefer that over the
+                                    # locally-generated one to match actual threading headers.
+                                    r["orig_message_id"] = msg_mid
+                                    r["rfc_message_id"] = msg_mid
+
+                                r["orig_references"] = msg_obj.get("References", "") or r.get("orig_references", "")
+                                r["orig_date"] = msg_obj.get("Date", "") or r.get("orig_date", "")
+
                             if uid_val:
                                 r["orig_imap_uid"] = str(uid_val)
                                 if label_name:
@@ -1180,7 +1212,7 @@ def module2_followup_task(self, job_id: str, payload_path: str):
                             job_dir,
                             f"[{i+1}/{total}] WARNING: reply check failed for {to_addr} (mid={mid}): {e}",
                         )
-                        break
+                        continue  # ✅ FIXED: Try next Message-ID instead of giving up
 
                 if reply_detected:
                     _write_log(job_dir, f"[{i+1}/{total}] SKIP (prospect already replied in thread) -> {to_addr}")
@@ -1215,7 +1247,7 @@ def module2_followup_task(self, job_id: str, payload_path: str):
                             job_dir,
                             f"[{i+1}/{total}] WARNING: reply check failed for {to_addr} (mid={mid}): {e}",
                         )
-                        break
+                        continue  # ✅ FIXED: Try next Message-ID instead of giving up
 
                 if reply_detected:
                     _write_log(job_dir, f"[{i+1}/{total}] SKIP (prospect already replied in thread) -> {to_addr}")
